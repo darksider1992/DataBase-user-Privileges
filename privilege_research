@@ -1,0 +1,154 @@
+ 权限控制是可以通过设置赋予不同的登录用户（login_user）不同的权限来控制，但是考虑以下的一种情况：
+ 比如现在某HR系统有三个层级的访问需求，分别是CEO，Manger，Employee;
+ 要求CEO能看到所有层级的数据，Manager能看到自身和Employee的数据，而Employee只能看到自己的数据。
+ 
+ 一个标准化的数据库，基表自然是不能让SA以外的角色看的，应该都是使用视图来查看数据，各个角色仅能对被赋予了权限的表/视图进行操作。
+ 因此为实现以上需求实现一般做法都是建三个视图，分别显示三个阶层能访问的内容。
+ 注意：三个视图数据抽取自基表，各个login 不能访问基表。并且让其他阶层无法访问除自身以外的视图。
+ 
+ 这个方法实现基本上可以分为以下几个步骤：
+ 0， 首先定义基表：
+ CREATE TABLE dbo.tb_Test_ViewPermission
+(
+        id int identity(1,1) not null primary key
+        ,name varchar(20) not null
+        ,level_no int not null
+        ,title varchar(20) null
+        ,viewByCEO char(1) not null
+        ,viewByManager char(1) not null
+        ,viewByEmployee char(1) not null
+        ,salary decimal(9,2) not null
+);
+
+--data init.
+INSERT INTO dbo.tb_Test_ViewPermission
+SELECT 'AA',0,'CEO','Y','Y','Y',1000000.0
+union all
+SELECT 'BB',1,'Manager','Y','Y','Y',100000.0
+union all
+SELECT 'CC',2,'employee','Y','Y','Y',10000.0
+;
+GO
+ 1， 建三个视图，分别过滤出自己所在层级及以下层级的数据。
+ 比如，CEO包含CEO、Manager和employee层级数据；Manger包含Manger和employee层级数据；employee仅包含employee层级数据。
+ 
+ 2，所有视图创建完毕后，接下来是最为关键的步骤，就是对视图权限的设置。
+ 基本的思路是：拿掉所有用户对于基表的权限，对于视图需要拿掉自己以下层级用户权限，然后给予视图自己层级用户的查看权限。
+ 比如：Manager层级视图dbo.v_employeeinfo_forManager需要拿掉employee的权限，授予Manager查询权限。 
+
+ DENY ALL ON dbo.v_employeeinfo_forCEO TO Manager;
+ DENY ALL ON dbo.v_employeeinfo_forCEO TO employee;
+ DENY ALL ON dbo.v_employeeinfo_forManager TO employee;
+ GRANT SELECT ON dbo.v_employeeinfo_forCEO TO CEO;
+ GRANT SELECT ON dbo.v_employeeinfo_forManager TO Manager;
+ GRANT SELECT ON dbo.v_employeeinfo_forEmployee TO employee;
+ ===========================================
+ 以上方法好处是直观，容易理解，但是实际中对权限的操作略显麻烦并且保有多个相同作用仅仅是为了区分不同权限的视图一方面不够简洁，另一方面也不便于后期的管理
+ 有没有办法只建一个视图，根据不同的login 来返回不同的结果呢？
+ 
+ 本文考虑引入一张权限控制表[dbo].[permisson_control_configuration]作为lookup表, 在create view语句中用where 来限定来自不同login_name所能查到的数据。
+ 
+ ===========================================
+创建三个用户CEO，Manager和employee，然后创建测试表tb_Test_ViewPermission，每个层级一条数据,插入三条测试数据,建立LOOKUP表[permisson_control_configuration]
+
+USE testusage_z
+GO
+
+--create three logins(CEO, manager, employee)
+--create login CEO
+--change the KEYWORD 'CEO' in below code block to 'Manager' and 'Employee', remember to change the PW for each login.
+
+---------------------------------------------
+IF EXISTS(
+            SELECT *
+            FROM sys.syslogins
+            WHERE name = 'CEO')
+BEGIN
+      DROP LOGIN CEO;
+END
+GO
+CREATE LOGIN CEO with password='CDBO',check_policy = off;
+GO
+
+--create user CEO
+IF USER_ID('CEO') is not null
+        DROP USER CEO;
+GO
+CREATE USER CEO FOR LOGIN CEO;
+GO
+----------------------------------------------
+
+--create basic TABLE
+IF OBJECT_ID('dbo.tb_Test_ViewPermission','u')is not null
+    DROP TABLE dbo.tb_Test_ViewPermission
+;
+GO
+CREATE TABLE dbo.tb_Test_ViewPermission
+(
+        id int identity(1,1) not null primary key
+        ,name varchar(20) not null
+        ,level_no decimal (5,2) --为防止需要再两个阶层之间添加新的阶层，需要将level设置为小数类型而非整形int
+        ,title varchar(20) null
+        ,viewByCEO char(1) not null
+        ,viewByManager char(1) not null
+        ,viewByEmployee char(1) not null
+        ,salary decimal(9,2) not null
+);
+
+--data init.
+INSERT INTO dbo.tb_Test_ViewPermission
+SELECT 'AA',0,'CEO','Y','Y','Y',1000000.0
+union all
+SELECT 'BB',1,'Manager','Y','Y','Y',100000.0
+union all
+SELECT 'CC',2,'employee','Y','Y','Y',10000.0
+;
+GO
+
+--create LOOKUP TABLE
+
+IF OBJECT_ID('dbo.permisson_control_configuration','u')is not null
+    DROP TABLE dbo.permisson_control_configuration
+;
+GO
+
+CREATE TABLE dbo.permisson_control_configuration
+(
+USER_NAME varchar(255), VIEW_DEPTH int
+)
+
+--LOOKUP table contain the privilege defined for different users
+INSERT INTO dbo.permisson_control_configuration
+SELECT title, level_no
+from dbo.tb_Test_ViewPermission
+ 
+ =============================================
+ 建立视图语句
+ 
+ IF OBJECT_ID('dbo.v_Test_ViewPermission','v')is not null
+        DROP VIEW dbo.v_Test_ViewPermission
+;
+GO
+CREATE VIEW dbo.v_Test_ViewPermission
+AS
+SELECT *
+FROM dbo.tb_Test_ViewPermission WITH(NOLOCK)
+WHERE level_no >= (select VIEW_DEPTH from dbo.permisson_control_configuration pcc where pcc.user_name = USER_NAME()) --通过这条WHERE条件来实现不同用户的查询返回
+GO
+
+=============================================
+最后，将视图v_Test_ViewPermission 的SELECT权限赋予给CEO，Manager，Employee三个user。
+GRANT SELECT ON dbo.v_Test_ViewPermission TO CEO;
+
+GRANT SELECT ON dbo.v_Test_ViewPermission TO Manager;
+
+GRANT SELECT ON dbo.v_Test_ViewPermission TO employee;
+ ===========================================
+ 
+针对后期管理情况，比如需要添加一个VicePresident（VP）层级在Manager之上CEO之下，除了前面的创建登录login和用户user以外，
+可以在更新（添加）基表数据时约定新加入的VP组数据的[level_no]为 0.5，并且将[VP,0.5] 添加到权限控制表[permisson_control_configuration]中，就可以通过VP登录DB并且只能查看到视图中登录角色为VP的权限范围内的数据。
+============================================
+
+另：后期如果需要收回权限可以使用REVOKE命令
+
+
